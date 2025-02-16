@@ -10,9 +10,30 @@ Kenta Kawasaki1,2, Sohrab Salehi3, Yingqian A. Zhan4, Kevin Chen5, Jun Ho Lee1, 
 
 ## Organization
 
-Each figure will have its own notebook file.
+The repository is organized as follows.
 
+`src/Notebooks` contains the notebooks to reproduce figures in the study.
+The directory contains the following files.
 
+```
+- common_utils.py
+- preprocessing.ipynb
+- FOXA2_compartments.ipynb
+- integration_harmony.ipynb
+- integration_scvi.ipynb
+- tmb_comparison.ipynb
+```
 
+Here we describe each file. 
 
+`common_utils.py`: Utility functions that are shared across the notebooks. 
 
+`preprocessing.ipynb` Functions for dublet detection.
+
+`FOXA2_compartments.ipynb`: Generates figures related to tissue compartment expressing FOXA2.
+
+`integration_harmony.ipynb`: Generates figures related to batch correction using harmony.
+
+`integration_scvi.ipynb`: Generates figures related to batch correction using scVI.
+
+`tmb_comparison.ipynb`: Generates figures related to the study of the tumor mutation burden.
