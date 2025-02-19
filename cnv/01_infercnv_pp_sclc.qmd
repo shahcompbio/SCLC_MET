@@ -1,0 +1,129 @@
+---
+title: "SCLC InferCNV Post-processing"
+author: "Matthew Zatzman"
+date: "`r Sys.Date()`"
+format: 
+  html:
+    code-fold: true
+    code-tools: true
+    code-link: true
+    toc: true
+execute:
+  cache: false
+---
+
+```{r setup}
+#| output: false
+library(tidyverse)
+# library(zellkonverter)
+library(ggthemes)
+library(dittoSeq)
+library(patchwork)
+# library(Matrix)
+library(glue)
+library(ggplotify)
+library(ggh4x)
+load_all("~/repos/scatools")
+library(here)
+library(bsub)
+```
+
+
+```{r}
+sce <- read_rds("sclc_10mb_merged_sce.rds")
+
+# Fix patient ids
+last_let <- str_sub(sce$patient, start = -1, end = -1)
+
+repl_idx <- grepl(pattern = "[[:alpha:]]", x = last_let)
+
+sce$patient <- as.character(sce$patient)
+
+sce$patient[repl_idx] <- str_sub(sce$patient[repl_idx], start = 1, end = -2)
+```
+
+
+Run per patient
+
+```{r}
+sce_list <- lapply(unique(sce$patient), function(x) sce[, colData(sce)$patient == x])
+names(sce_list) <- unique(sce$patient)
+pt_size <- 1
+alpha <- 1
+```
+
+
+```{r}
+for (i in seq_along(sce_list)) {
+  sc <- sce_list[[i]]
+
+  pid <- unique(sc$patient)
+
+  outdir <- here("cnv", "infercnv", glue("objects/{pid}"))
+
+  plotdir <- here("cnv", "infercnv", "plots")
+
+  dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+  final_out <- file.path(outdir, glue("{pid}_clustered_sce.rds"))
+  if (file.exist(final_out)) {
+    message("Already done")
+  } else {
+    bsub_chunk(
+      name = glue("{pid}_inferpp"),
+      enforce = TRUE,
+      image = TRUE,
+      working_dir = outdir,
+      temp_dir = outdir,
+      output_dir = outdir,
+      hours = 2,
+      memory = 8,
+      cores = 4,
+      code = {
+        devtools::load_all("~/repos/scatools")
+        sc <- cluster_seurat(sc, assay_name = "counts", algorithm = "leiden", umap.metric = "cosine", annoy.metric = "euclidean", resolution = 0.25, suffix = "_patient")
+
+        p1 <- dittoDimPlot(sc, var = "clusters_patient", size = pt_size, opacity = alpha, reduction.use = "UMAP_patient")
+        p2 <- dittoDimPlot(sc, var = "sample", size = pt_size, opacity = alpha, reduction.use = "UMAP_patient")
+        p3 <- dittoDimPlot(sc, var = "predicted.ann_level_1", size = pt_size, opacity = alpha, reduction.use = "UMAP_patient") +
+          scale_color_ptol()
+        p4 <- dittoDimPlot(sc, var = "cnv_score2", size = pt_size, opacity = alpha, reduction.use = "UMAP_patient") + scale_color_viridis_c(limits = c(min(sc$cnv_score2), 0.05), oob = scales::squish)
+
+        cluster_mix_plot <- colData(sc) %>%
+          as.data.frame() %>%
+          ggplot(aes_string(x = "clusters_patient")) +
+          geom_bar(aes_string(fill = "predicted.ann_level_1"), position = "fill") +
+          scale_fill_ptol() +
+          labs(x = "Cluster", y = "Cell proportion", fill = "Cell type")
+
+        ht <- cnaHeatmap(sc, assay_name = "counts", clone_name = "clusters_patient", col_fun = logr_col_fun(breaks = c(-0.05, -0.01, 0.01, 0.05), colors = c("blue", "white", "white", "red")), log2 = T, col_clones = dittoColors(), legend_name = "log2ratio") %>% as.ggplot()
+
+        clone_ht <- cloneCnaHeatmap(sc, assay_name = "counts", clone_name = "clusters_patient", col_fun = logr_col_fun(breaks = c(-0.05, -0.01, 0.01, 0.05), colors = c("blue", "white", "white", "red")), log2 = T, col_clones = dittoColors(), legend_name = "log2ratio") %>% as.ggplot()
+
+        umap_plot <- wrap_plots(list(p1, p2, p3, p4), ncol = 2)
+
+        pdf(file = glue("{plotdir}/{pid}_infercnv.pdf"), width = 14, height = 8)
+        plot(umap_plot)
+        plot(cluster_mix_plot)
+        plot(ht)
+        plot(clone_ht)
+        dev.off()
+
+        saveRDS(sc, file = final_out)
+      }
+    )
+  }
+}
+```
+
+
+## Global UMAP
+
+```{r}
+sce_epi <- sce[, sce$predicted.ann_level_1 %in% c("Epithelial", "Stroma")]
+# To save space subset for epithelial
+sce_epi <- cluster_seurat(sce_epi, assay_name = "counts", algorithm = "leiden", umap.metric = "cosine", annoy.metric = "cosine", resolution = 0.2)
+
+
+saveRDS(sce_epi, file = "sclc_10mb_merged_sce_epistromaonly_clustered.rds")
+```

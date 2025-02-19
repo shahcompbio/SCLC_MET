@@ -1,0 +1,295 @@
+---
+title: "SCLC Infer CNV Analysis"
+author: "Matthew Zatzman"
+date: "`r Sys.Date()`"
+format: 
+  html:
+    code-fold: true
+    code-tools: true
+    code-link: true
+    toc: true
+execute:
+  cache: false
+---
+
+```{r setup}
+#| output: false
+library(tidyverse)
+library(infercnv)
+library(anndata)
+library(reticulate)
+use_condaenv("scanpy_new")
+# library(zellkonverter)
+library(ggthemes)
+library(dittoSeq)
+library(patchwork)
+library(Matrix)
+library(glue)
+library(ggplotify)
+library(ggh4x)
+load_all("~/repos/scatools")
+library(here)
+```
+
+# Introduction
+
+inferCNV requires:
+
+-   a raw counts matrix of single-cell RNA-Seq expression
+-   an annotations file which indicates which cells are tumor vs. normal.
+-   a gene/chromosome positions file
+
+### Gene order file
+
+Generate the gene order positional file
+
+```{r}
+#| echo: false
+overwrite <- FALSE
+attribute_type <- "gene_name"
+
+gene_order_file <- here("cnv", "infercnv", glue("gene_order_{attribute_type}.txt"))
+
+keep_chrs <- c(1:22)
+
+if (!file.exists(gene_order_file) & !overwrite) {
+  # Download the script from the github repo
+  gtf_to_position_py <- "https://raw.githubusercontent.com/broadinstitute/infercnv/master/scripts/gtf_to_position_file.py"
+
+  curl::curl_download(gtf_to_position_py, destfile = "gtf_to_position_file.py")
+
+  # Select the annotation gtf used by cellranger
+  cr_gtf <- "/work/shah/reference/transcriptomes/GRCh38/genes/genes.gtf"
+
+  stopifnot("Can't find gtf" = file.exists(cr_gtf))
+
+  # Run the conversion
+  system(glue("python gtf_to_position_file.py --attribute_name {attribute_type} {cr_gtf} {gene_order_file}"))
+
+  # Load the file and reorder and remove other chrs
+  gene_order <- read.table(file = gene_order_file, header = F, sep = "\t")
+  gene_order <- gene_order[gene_order$V2 %in% keep_chrs, ] %>%
+    arrange(as.numeric(V2), V3)
+  write.table(gene_order, file = gene_order_file, quote = F, sep = "\t", col.names = F, row.names = F)
+} else {
+  message(glue("{gene_order_file} already exists!"))
+}
+```
+
+
+### Load counts
+
+```{r}
+#| output: false
+h5ad_f <- "/work/shah/users/salehis/projects/sclc/results/patient_met/sclc_patient_data_filtered.h5ad"
+
+
+h5ad <- read_h5ad(h5ad_f, backed = "r")
+
+# Subset for patient
+# pt_cells <- rownames(h5ad$obs[h5ad$obs$patient == "ND35",])
+
+# keep_cells <- intersect(keep_cells, rownames(h5ad))
+
+# keep_cells <- intersect(keep_cells, pt_cells)
+
+counts <- h5ad$layers["counts"] %>%
+  as(., "CsparseMatrix") %>%
+  t()
+```
+
+
+```{r}
+#| echo: false
+# Check for raw integer counts
+stopifnot("Must provide integer counts" = all(counts[, 1] - floor(counts[, 1]) == 0))
+```
+
+### Cell annotations
+
+
+We'll load cell metadata to subset for InferCNV
+
+```{r}
+# Load liftover calls
+lift <- read.table(file = here("azimuth", "sclc_lungref_azimuth_refmapped.txt"), header = T, sep = "\t")
+
+# Subset for overlapping cells
+rownames(lift) <- lift$cell_id
+lift <- lift[colnames(counts), ]
+
+# Merge metadata
+# Relevant metadata cols
+meta_cols <- c("sample", "patient_id")
+
+metadata <- h5ad$obs[, meta_cols] %>%
+  rownames_to_column("cell_id") %>%
+  left_join(lift) %>%
+  dplyr::rename(patient = patient_id)
+rownames(metadata) <- metadata$cell_id
+metadata$control <- FALSE
+
+# Ensure consistent order
+counts <- counts[, metadata$cell_id]
+```
+
+
+### InferCNV
+
+#### Run InferCNV
+
+<details>
+
+<summary>Show Code</summary>
+
+Run setup
+
+```{r}
+# Loop over patients
+library(bsub)
+
+pt_list <- filter(metadata) %>%
+  pull(patient) %>%
+  unique() %>%
+  as.vector() %>%
+  sort()
+
+# Update metadata column for infercnv
+metadata$infercnv_meta <- with(metadata, paste(patient, predicted.ann_level_1, sep = "_"))
+```
+
+Run
+
+```{r}
+for (i in seq_along(pt_list)) {
+  pid <- pt_list[i]
+
+  out_dir <- here("cnv", "infercnv", "results_w_ctrl", pid)
+
+  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+  pid_cells <- metadata[metadata$patient == pid, "cell_id"]
+
+  # Get control cells
+  control_cells_df <- metadata %>%
+    filter(patient != pid) %>%
+    # filter(predicted.ann_level_1 != "Epithelial") %>%
+    slice_sample(n = 5, by = c(patient, predicted.ann_level_1), replace = F) %>%
+    mutate(infercnv_meta = paste("ctrl", predicted.ann_level_1, sep = "_"))
+
+  control_cells <- control_cells_df$cell_id
+
+  run_cells <- c(control_cells, pid_cells)
+
+  ref_group_names <- control_cells_df %>%
+    pull(infercnv_meta) %>%
+    unique()
+
+  run_metadata <- rbind.data.frame(metadata[pid_cells, ], control_cells_df)
+
+  infercnv_obj_final_file <- file.path(out_dir, "run.final.infercnv_obj")
+
+  if (!file.exists(infercnv_obj_final_file)) {
+    bsub_chunk(
+      name = glue("{pid}_infercnv"),
+      image = TRUE,
+      hours = 24,
+      cores = 8,
+      memory = 8,
+      working_dir = out_dir,
+      output_dir = out_dir,
+      temp_dir = out_dir,
+      code = {
+        infercnv_obj <- CreateInfercnvObject(
+          raw_counts_matrix = counts[, run_cells],
+          annotations_file = as.data.frame(run_metadata[run_cells, "infercnv_meta", drop = FALSE]),
+          delim = "\t",
+          gene_order_file = gene_order_file,
+          ref_group_names = ref_group_names
+        )
+
+        infercnv_obj <- infercnv::run(infercnv_obj,
+          cutoff = 0.1, # cutoff=1 works well for Smart-seq2, and cutoff=0.1 works well for 10x Genomics
+          out_dir = out_dir,
+          cluster_by_groups = TRUE,
+          denoise = TRUE,
+          HMM = F,
+          num_threads = 8,
+          leiden_method = "PCA",
+          leiden_resolution = 0.05,
+          no_prelim_plot = TRUE,
+          save_rds = FALSE,
+          analysis_mode = "subclusters",
+          resume_mode = TRUE
+        )
+      }
+    )
+  } else {
+    message("Already done")
+  }
+}
+```
+
+</details>
+
+#### Results
+
+Merge the counts into a `SingleCellExperiment` binned at 10mb
+
+```{r}
+# Get all gene ordering
+gene_order <- read.table(file = here("cnv", "infercnv", "gene_order_gene_name.txt"), col.names = c("gene", "chr", "start", "end"))
+rownames(gene_order) <- gene_order$gene
+
+results_dir <- here("cnv", "infercnv", "results_w_ctrl")
+samples <- dir(results_dir)
+
+# counts_list <- vector(mode = "list")
+
+sce_list <- vector(mode = "list")
+
+for (i in seq_along(samples)) {
+  samp <- samples[i]
+
+  print(glue("{i}: {samp}"))
+
+  infercnv_obj_f <- file.path(results_dir, samp, "run.final.infercnv_obj")
+
+  if (file.exists(infercnv_obj_f)) {
+    counts <- readRDS(infercnv_obj_f)@expr.data
+  } else {
+    logger::log_warn("Missing final infercnv results")
+    next
+  }
+
+  sce <- SingleCellExperiment(list("counts" = counts), colData = metadata[colnames(counts), ], rowRanges = makeGRangesFromDataFrame(gene_order[rownames(counts), ], keep.extra.columns = T))
+
+  sce$samp_lwr <- tolower(sce$sample)
+
+  sce <- sce[, sce$samp_lwr == samp]
+
+  sce_list[[samp]] <- sce
+}
+
+bins <- get_tiled_bins(bs_genome = BSgenome.Hsapiens.UCSC.hg38::BSgenome.Hsapiens.UCSC.hg38, tilewidth = 1e7, respect_chr_arms = TRUE)
+
+# Rebin the data
+sce_list_rb <- lapply(sce_list, rebin_sce, assay = "counts", new_bins = bins, ncores = 8)
+
+common_bins <- Reduce(intersect, lapply(sce_list_rb, rownames))
+
+
+sce_list_rb <- lapply(sce_list_rb, function(x) {
+  x[common_bins]
+})
+
+# Merge into single object
+sce <- do.call(cbind, sce_list_rb)
+
+sce <- calc_cnv_score(sce)
+
+sce$cnv_score2 <- colSds(assay(sce, "counts"))
+
+# Save out
+saveRDS(sce, file = "sclc_10mb_merged_sce.rds")
+```

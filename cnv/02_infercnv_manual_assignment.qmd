@@ -1,0 +1,216 @@
+---
+title: "SCLC InferCNV Post analysis"
+author: "Matthew Zatzman"
+date: "`r Sys.Date()`"
+format: 
+  html:
+    code-fold: true
+    code-tools: true
+    code-link: true
+    toc: true
+execute:
+  cache: false
+---
+
+```{r setup}
+#| output: false
+library(tidyverse)
+library(ggthemes)
+library(dittoSeq)
+library(patchwork)
+library(glue)
+library(ggplotify)
+library(ggh4x)
+load_all("~/repos/scatools")
+library(yaml)
+library(here)
+```
+
+Load yaml with manual assignments
+```{r}
+tumor_info <- read_yaml(here("cnv", "infercnv", "infercnv_manual_annotation.yaml"))
+```
+
+
+Load clustered sces
+
+```{r}
+sce_list_f <- dir(here("cnv", "infercnv", "objects"), pattern = "*_clustered_sce.rds", recursive = TRUE, full.names = T)
+
+sce_list <- lapply(sce_list_f, readRDS)
+
+names(sce_list) <- lapply(sce_list, FUN = function(sc) {
+  unique(sc$patient)
+})
+```
+
+Loop over and assign malignant clones, recluster where necessary
+
+```{r}
+# Recluster list for manual workup
+recluster_sce_list <- vector(mode = "list")
+
+for (i in seq_along(sce_list)) {
+  sc <- sce_list[[i]]
+  pid <- unique(sc$patient)
+
+  message(glue("{i} of {length(sce_list)}: {pid}"))
+
+  sc$is_tumor_cell <- FALSE
+  sc$is_tumor_cell_confidence <- NA
+
+
+  tumor_clusters <- tumor_info[[pid]]$tumor_cluster
+  confidence <- tumor_info[[pid]]$confidence
+  recluster <- tumor_info[[pid]]$recluster
+
+  if (!is.null(recluster)) {
+    if (recluster == TRUE) {
+      recluster_sce_list[[pid]] <- sc
+      next
+    }
+  }
+
+  if (!"NA" %in% tumor_clusters) {
+    sc[, sc$clusters_patient %in% tumor_clusters]$is_tumor_cell <- TRUE
+
+    for (j in seq_along(tumor_clusters)) {
+      sc[, sc$clusters_patient == tumor_clusters[j]]$is_tumor_cell_confidence <- confidence[j]
+    }
+  }
+
+
+  sce_list[[pid]] <- sc
+}
+```
+
+
+Do the reclustering
+
+```{r}
+recluster_sce_list <- lapply(recluster_sce_list, function(sce) {
+  sce <- cluster_seurat(sce, assay_name = "counts", algorithm = "leiden", umap.metric = "euclidean", annoy.metric = "euclidean", resolution = 0.5, suffix = "_recluster")
+  return(sce)
+})
+```
+
+
+```{r}
+plotdir <- here("cnv", "infercnv", "plots")
+
+pt_size <- 1
+alpha <- 1
+recluster_plots <- lapply(recluster_sce_list, FUN = function(sc) {
+  pid <- unique(sc$patient)
+
+  p1 <- dittoDimPlot(sc, var = "clusters_recluster", size = pt_size, opacity = alpha, reduction.use = "UMAP_recluster", do.label = TRUE)
+  p2 <- dittoDimPlot(sc, var = "sample", size = pt_size, opacity = alpha, reduction.use = "UMAP_recluster")
+  p3 <- dittoDimPlot(sc, var = "predicted.ann_level_1", size = pt_size, opacity = alpha, reduction.use = "UMAP_recluster") +
+    scale_color_ptol()
+  p4 <- dittoDimPlot(sc, var = "cnv_score2", size = pt_size, opacity = alpha, reduction.use = "UMAP_recluster") + scale_color_viridis_c(limits = c(min(sc$cnv_score2), 0.05), oob = scales::squish)
+
+  cluster_mix_plot <- colData(sc) %>%
+    as.data.frame() %>%
+    ggplot(aes_string(x = "clusters_recluster")) +
+    geom_bar(aes_string(fill = "predicted.ann_level_1"), position = "fill") +
+    scale_fill_ptol() +
+    labs(x = "Cluster", y = "Cell proportion", fill = "Cell type")
+
+  cnv_score_plot <- colData(sc) %>%
+    as.data.frame() %>%
+    ggplot(aes(x = clusters_recluster, y = cnv_score2)) +
+    geom_violin(scale = "width") +
+    scale_fill_manual(values = dittoColors())
+
+  ht <- cnaHeatmap(sc, assay_name = "counts", clone_name = "clusters_recluster", col_fun = logr_col_fun(breaks = c(-0.05, -0.01, 0.01, 0.05), colors = c("blue", "white", "white", "red")), log2 = T, col_clones = dittoColors(), legend_name = "log2ratio") %>% as.ggplot()
+
+  clone_ht <- cloneCnaHeatmap(sc, assay_name = "counts", clone_name = "clusters_recluster", col_fun = logr_col_fun(breaks = c(-0.05, -0.01, 0.01, 0.05), colors = c("blue", "white", "white", "red")), log2 = T, col_clones = dittoColors(), legend_name = "log2ratio") %>% as.ggplot()
+
+  umap_plot <- wrap_plots(list(p1, p2, p3, p4), ncol = 2)
+
+  pdf(file = glue("{plotdir}/{pid}_infercnv_reclustered.pdf"), width = 14, height = 8)
+  plot(umap_plot)
+  plot(cluster_mix_plot)
+  plot(cnv_score_plot)
+  plot(ht)
+  plot(clone_ht)
+  dev.off()
+})
+```
+
+Reload updated assignments and assign the reclustered
+
+```{r}
+tumor_info <- read_yaml(here("cnv", "infercnv", "infercnv_manual_annotation.yaml"))
+
+for (i in seq_along(recluster_sce_list)) {
+  sc <- recluster_sce_list[[i]]
+  pid <- unique(sc$patient)
+
+  message(glue("{i} of {length(recluster_sce_list)}: {pid}"))
+
+  sc$is_tumor_cell <- FALSE
+  sc$is_tumor_cell_confidence <- NA
+
+
+  tumor_clusters <- tumor_info[[pid]]$recluster_tumor_cluster
+  confidence <- tumor_info[[pid]]$recluster_confidence
+  recluster <- tumor_info[[pid]]$recluster
+
+
+  sc[, sc$clusters_recluster %in% tumor_clusters]$is_tumor_cell <- TRUE
+
+  for (j in seq_along(tumor_clusters)) {
+    sc[, sc$clusters_recluster == tumor_clusters[j]]$is_tumor_cell_confidence <- confidence[j]
+  }
+  
+  sc$infercnv_reclustered <- TRUE
+
+
+  sce_list[[pid]] <- sc
+}
+```
+
+Prepare for dataset merge
+
+```{r}
+# Get and fill all column names
+common_bins <- Reduce(intersect, lapply(sce_list, rownames))
+
+all_cols <- Reduce(union, lapply(sce_list, FUN = function(x) colnames(colData(x))))
+
+sce_list <- lapply(sce_list, FUN = function(x) {
+  missing_cols <- setdiff(all_cols, colnames(colData(x)))
+  if (length(missing_cols) >= 1) {
+    colData(x)[,missing_cols] <- NA
+  }
+  
+  metadata(x) <- list()
+  reducedDims(x) <- list()
+ return(x[common_bins,])
+})
+
+sce <- do.call("cbind", sce_list)
+```
+
+Save flat file
+
+```{r}
+colData(sce) %>%
+  as.data.frame() %>%
+  select(cell_id, sample, samp_lwr, patient, cnv_score2, cnv_clusters_patient = clusters_patient, is_tumor_cell, is_tumor_cell_confidence, cnv_cluster_recluster = clusters_recluster, infercnv_reclustered) %>%
+  write.table(gzfile(here("cnv", "infercnv", "sclc_infercnv_results.txt.gz")), quote = F, sep = "\t", row.names = F, col.names = TRUE)
+```
+
+Cluster the cohort wide object
+
+```{r}
+sce <- cluster_seurat(sce, assay_name = "counts", algorithm = "leiden", resolution = 0.25, annoy.metric = "euclidean", umap.metric = "euclidean", suffix = "_cohort")
+```
+
+Save out
+
+```{r}
+saveRDS(sce, file = here("cnv", "infercnv", "sclc_10mb_merged_sce_tumorcell_assigned_sce.rds"))
+```
+
