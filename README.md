@@ -17,8 +17,6 @@ Kenta Kawasaki<sup>1,2</sup>, Sohrab Salehi<sup>3</sup>, Yingqian A. Zhan<sup>4<
 <sup>8</sup> Weill Cornell Medicine Graduate School of Medical Sciences, New York, NY, USA  
 
 
-
-
 ## Organization
 
 The repository is organized as follows.
@@ -34,6 +32,7 @@ The directory contains the following files.
 - integration_scvi.ipynb
 - co_expression.ipynb
 - fetal_scores.ipynb
+- FOXA2_expression.ipynb
 - tmb_comparison.ipynb
 ```
 
@@ -52,5 +51,7 @@ Here we describe each file.
 `co_expression.ipynb`: Generates figures related to co-expression of FOXA2 and select TFs.
 
 `fetal_scores.ipynb`: Generates figures related to fetal scores in FOXA2+ and FOXA2- cells.
+
+`FOXA2_expression.ipynb`: Generates figures related to genes correlated with FOXA2's expression.
 
 `tmb_comparison.ipynb`: Generates figures related to the study of the tumor mutation burden.
