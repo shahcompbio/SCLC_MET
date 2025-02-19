@@ -186,3 +186,19 @@ def mini_process(adata, use_harmony=False, do_scale=False, max_iter_harmony=100,
     sc.pp.neighbors(adata, use_rep=use_rep)
     sc.tl.umap(adata)
     return adata
+
+
+def load_msigdb():
+    """
+    Reads the local version of MSigDB if it exists, otherwise uses the decoupler to get the data.
+    """
+    if os.path.exists(MSIGDB_HALLMARK_PATH):
+        msigdb = pd.read_csv(MSIGDB_HALLMARK_PATH)
+    else:
+        # Load the pathways from MSigDB Subramanian, Aravind, et al. "Gene set enrichment analysis: a knowledge-based approach for interpreting genome-wide expression profiles." Proceedings of the National Academy of Sciences 102.43 (2005): 15545-15550.
+        # e.g., from https://www.gsea-msigdb.org/gsea/msigdb
+        # Here we use the decoupler package
+        import decoupler as dc
+        msigdb = dc.get_resource("MSigDB")
+        msigdb.to_csv(MSIGDB_HALLMARK_PATH, compression="gzip")
+    return msigdb
